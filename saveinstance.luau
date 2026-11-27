@@ -3,154 +3,6 @@
 --!divine-intellect
 -- https://discord.gg/wx4ThpAsmw
 
--- ============================================================
---  CHUNK COLLECTOR v2 — параллельная батч-декомпиляция
---  Использует Luacid HTTP в N параллельных корутинах.
--- ============================================================
-local pendingScripts = {}   -- [src] = { bytecode = ..., ref = ... }
-local pendingOrder = {}     -- массив src
-local collectMode = false
-
-local MAX_CONCURRENT = 8    -- сколько параллельных запросов к Luacid
-local BATCH_SIZE = 8        -- сколько корутин за раз
-
--- Собирает скрипт в очередь (вместо немедленного decompile).
--- Возвращает кэш, если он уже есть — тогда в очередь не кладём.
-local function collectScript(src)
-    if not collectMode then
-        return nil
-    end
-    if pendingScripts[src] then
-        return nil
-    end
-    local ok, bc = pcall(getscriptbytecode, src)
-    if not ok or type(bc) ~= "string" or #bc == 0 then
-        return nil
-    end
-    -- Проверяем кэш ДО добавления в очередь
-    local cached = cacheGet(bc)
-    if cached then
-        return cached
-    end
-    pendingScripts[src] = { bytecode = bc, ref = src }
-    table.insert(pendingOrder, src)
-    return nil
-end
-
--- Включаем режим сбора (вызывать перед основным циклом SaveInstance)
-function GLOBAL_ENV.beginDecompileCollection()
-    collectMode = true
-    pendingScripts = {}
-    pendingOrder = {}
-end
-
--- Декомпилирует один байткод через Luacid (или fallback).
--- Возвращает source, либо nil если не удалось.
-local function batchDecompileOne(bytecode, ref)
-    -- 1) Кэш
-    local cached, key = cacheGet(bytecode)
-    if cached then
-        return cached
-    end
-
-    -- 2) Luacid
-    local source
-    if luacid_decompile and ref then
-        local ok, result = pcall(luacid_decompile, ref)
-        if ok and type(result) == "string" and #result > 0
-            and not result:find("^%-%- ") then
-            source = result
-        end
-    end
-
-    -- 3) Fallback: raw bytecode
-    if not source then
-        source = "-- RAW BYTECODE (Luacid unavailable)\n" .. bytecode
-    end
-
-    -- 4) Кэшируем
-    if key then
-        cachePut(key, source)
-    end
-    return source
-end
-
--- Параллельно декомпилирует всё, что накопилось.
--- Возвращает [src] = source.
-function GLOBAL_ENV.flushDecompileCollection()
-    collectMode = false
-    local n = #pendingOrder
-    if n == 0 then
-        return {}
-    end
-
-    local results = {}
-    local completed = 0
-
-    -- Разбиваем на батчи по MAX_CONCURRENT
-    local function processBatch(startIdx)
-        local tasks = {}
-        local endIdx = math.min(startIdx + MAX_CONCURRENT - 1, n)
-
-        for i = startIdx, endIdx do
-            local src = pendingOrder[i]
-            local entry = pendingScripts[src]
-            if entry then
-                local co = coroutine.create(function()
-                    local source = batchDecompileOne(entry.bytecode, entry.ref)
-                    results[src] = source
-                    completed += 1
-                end)
-                table.insert(tasks, co)
-            end
-        end
-
-        -- Запускаем все корутины батча
-        for _, co in tasks do
-            local ok, err = coroutine.resume(co)
-            if not ok then
-                warn("[SaveInstance] decompile coroutine error: " .. tostring(err))
-            end
-        end
-
-        -- Ждём завершения батча (Luacid HTTP = yield, корутины завершатся)
-        -- В executor'ах request блокирующий, так что корутины выполнятся синхронно
-        -- внутри resume. Если request асинхронный — нужен task.wait().
-        local batchDone = true
-        for _, co in tasks do
-            if coroutine.status(co) ~= "dead" then
-                batchDone = false
-                break
-            end
-        end
-
-        if not batchDone then
-            -- Асинхронный executor: ждём, пока батч завершится
-            local waited = 0
-            while not batchDone and waited < 60 do
-                task.wait(0.1)
-                waited += 0.1
-                batchDone = true
-                for _, co in tasks do
-                    if coroutine.status(co) ~= "dead" then
-                        batchDone = false
-                        break
-                    end
-                end
-            end
-        end
-    end
-
-    -- Идём батчами
-    for startIdx = 1, n, MAX_CONCURRENT do
-        processBatch(startIdx)
-    end
-
-    pendingScripts = {}
-    pendingOrder = {}
-    return results
-end
-
 local function string_find(s, pattern, init)
 	return string.find(s, pattern, init, true)
 end
@@ -5033,11 +4885,18 @@ local function synsaveinstance(...)
 		ldecompile = function()
 			return "-- Decompiling is disabled"
 		end
-	elseif decompile then
+		elseif decompile then
 		local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
 
+		-- ============================================================
+		--  ldecompile v2 — батч-совместимая версия
+		--  Приоритет:
+		--    1) ScriptCache (in-memory, мгновенно)
+		--    2) Батч-словарь GLOBAL_ENV._lastDecompiledScripts
+		--       (заполняется в synsaveinstance до save_game)
+		--    3) Синхронный fallback decomp(script)
+		-- ============================================================
 		ldecompile = function(script)
-			-- local name = scr.ClassName .. scr.Name
 			local bytecode
 			if ScriptCache then
 				local s
@@ -5065,25 +4924,52 @@ local function synsaveinstance(...)
 				if DecompileJobless then
 					return "-- Not found in already decompiled ScriptCache"
 				end
-
-				-- task.wait() -- TODO Maybe remove?
 			end
 
-			local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
-			if not result then
-				ok, result = false, "Empty Output"
-			end
+			-- ============================================================
+			--  БАТЧ: сначала пробуем взять готовый source
+			--  из GLOBAL_ENV._lastDecompiledScripts (заполняется
+			--  в synsaveinstance перед save_game через
+			--  flushDecompileCollection)
+			-- ============================================================
+			local batched = GLOBAL_ENV._lastDecompiledScripts
+				and GLOBAL_ENV._lastDecompiledScripts[script]
 
 			local output
-			if ok then
-				result = string.gsub(result, "\0", "\\0") -- ? Some decompilers sadly output \0 which prevents files from opening
-				output = result
+			if batched and type(batched) == "string" and #batched > 0 then
+				if __DEBUG_MODE then
+					__DEBUG_MODE("Found in Batch", script:GetFullName())
+				end
+				-- Нормализуем NUL → \\0 как и в синхронной ветке
+				output = string.gsub(batched, "\0", "\\0")
 			else
-				output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
+				-- ============================================================
+				--  СИНХРОННЫЙ FALLBACK
+				--  (если батч не сработал — сеть, синхронный executor,
+				--  или скрипт не попал в collect)
+				-- ============================================================
+				local ok, result = run_with_loading(
+					"Decompiling " .. script.Name,
+					true,
+					nil,
+					decomp,
+					script
+				)
+				if not result then
+					ok, result = false, "Empty Output"
+				end
+
+				if ok then
+					result = string.gsub(result, "\0", "\\0")
+					output = result
+				else
+					output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
+				end
 			end
 
-			if ScriptCache and bytecode then -- TODO there might(?) be an edgecase where it manages to decompile (built-in) even though getscriptbytecode failed, and the output won't get cached
-				ldeccache[bytecode] = output -- ? Should we cache even if it timed out?
+			-- Кэшируем в ScriptCache при наличии байткода
+			if ScriptCache and bytecode then
+				ldeccache[bytecode] = output
 				if __DEBUG_MODE then
 					__DEBUG_MODE("Cached", script:GetFullName())
 				end
@@ -7353,6 +7239,65 @@ local function synsaveinstance(...)
 	if OPTIONS.IgnoreSpecialProperties and gethiddenproperty then
 		old_gethiddenproperty = gethiddenproperty
 		gethiddenproperty = nil
+	end
+
+		-- ============================================================
+	--  ПРЕДВАРИТЕЛЬНАЯ БАТЧ-ДЕКОМПИЛЯЦИЯ
+	--  Собираем все LuaSourceContainer из ToSaveList + ExtraInstances,
+	--  декомпилируем параллельно, кладём в _lastDecompiledScripts.
+	--  ldecompile потом читает оттуда (см. ldecompile v2).
+	-- ============================================================
+	if OPTIONS.Decompile and GLOBAL_ENV.beginDecompileCollection then
+		GLOBAL_ENV.beginDecompileCollection()
+
+		local function collectAllScripts(root)
+			if not root then return end
+			local stack, size = { root }, 1
+			while size > 0 do
+				local inst = stack[size]
+				stack[size] = nil
+				size -= 1
+
+				if inst:IsA("LuaSourceContainer") then
+					GLOBAL_ENV.collectScript(inst)
+				end
+
+				for _, child in inst:GetChildren() do
+					size += 1
+					stack[size] = child
+				end
+			end
+		end
+
+		-- ToSaveList заполнен в блоке do...end выше
+		if ToSaveList then
+			for _, root in ToSaveList do
+				collectAllScripts(root)
+			end
+		end
+
+		-- ExtraInstances (если есть)
+		if OPTIONS.ExtraInstances then
+			for _, root in OPTIONS.ExtraInstances do
+				collectAllScripts(root)
+			end
+		end
+
+		-- Object (если есть)
+		if OPTIONS.Object then
+			collectAllScripts(OPTIONS.Object)
+		end
+
+		-- Декомпилируем всё разом (параллельно)
+		GLOBAL_ENV._lastDecompiledScripts = GLOBAL_ENV.flushDecompileCollection()
+
+		if __DEBUG_MODE then
+			local count = 0
+			for _ in GLOBAL_ENV._lastDecompiledScripts do
+				count += 1
+			end
+			__DEBUG_MODE("Batch decompiled", count, "scripts")
+		end
 	end
 
 	elapse_t = os.clock()
