@@ -1,5 +1,3 @@
-# PLEASE USE https://github.com/luau/UniversalSynSaveInstance
-
 # Loadstring
 
 ```lua
