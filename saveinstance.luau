@@ -80,21 +80,20 @@ do
 	)()
 
 	finder({
-		-- request = 'string.find(...,"request",nil,true) and not string.find(...,"internal",nil,true)',
 		base64encode = 'local a={...}local b=a[1]local function c(a,b)return string.find(a,b,nil,true)end;return c(b,"encode")and(c(b,"base64")or c(string.lower(tostring(a[2])),"base64"))',
 		base64decode = 'local a={...}local b=a[1]local function c(a,b)return string.find(a,b,nil,true)end;return c(b,"decode")and(c(b,"base64")or c(string.lower(tostring(a[2])),"base64"))',
-		-- cloneref = 'string.find(...,"clone",nil,true) and string.find(...,"ref",nil,true)',
-		-- decompile = '(string.find(...,"decomp",nil,true) and string.sub(...,#...) ~= "s")',
 		gethiddenproperty = 'string.find(...,"get",nil,true) and string.find(...,"h",nil,true) and string.find(...,"prop",nil,true) and string.sub(...,#...) ~= "s"',
 		gethui = 'string.find(...,"get",nil,true) and string.find(...,"h",nil,true) and string.find(...,"ui",nil,true)',
-		-- getcon = 'string.find(...,"get",nil,true) and (string.find(...,"conn",nil,true) or string.find(...,"sig",nil,true)) and string.sub(...,#(...))=="s"',
-		getnilinstances = 'string.find(...,"nil",nil,true) and string.find(...,"get",nil,true) and string.sub(...,#...) == "s"', -- ! Could match some unwanted stuff
-		getscriptbytecode = 'string.find(...,"get",nil,true) and string.find(...,"script",nil,true) and string.find(...,"bytecode",nil,true)', --  or string.find(...,"dump",nil,true) and string.find(...,"string",nil,true) due to Fluxus (dumpstring returns a function)
-		-- hash = 'local a={...}local b=a[1]local function c(a,b)return string.find(a,b,nil,true)end;return c(b,"hash")and c(string.lower(tostring(a[2])),"crypt")',
+		getnilinstances = 'string.find(...,"nil",nil,true) and string.find(...,"get",nil,true) and string.sub(...,#...) == "s"',
+		getscriptbytecode = 'string.find(...,"get",nil,true) and string.find(...,"script",nil,true) and string.find(...,"bytecode",nil,true)',
 		protectgui = 'string.find(...,"protect",nil,true) and string.find(...,"ui",nil,true) and not string.find(...,"un",nil,true)',
 		setrbxclipboard = 'string.find(...,"set",nil,true) and string.find(...,"rbx",nil,true) and string.find(...,"clipboard",nil,true)',
-		-- setthreadidentity = 'string.find(...,"identity",nil,true) and string.find(...,"set",nil,true)',
 	}, true, 10)
+
+	-- ============================================================
+	--  Luacid: загружаем современный декомпилятор вместо старого
+	-- ============================================================
+	global_container.loadLuacidDecompiler() -- устанавливает global_container.decompile
 end
 
 local identify_executor = identifyexecutor or getexecutorname or whatexecutor
