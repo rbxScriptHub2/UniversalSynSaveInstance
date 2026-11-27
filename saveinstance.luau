@@ -3,6 +3,154 @@
 --!divine-intellect
 -- https://discord.gg/wx4ThpAsmw
 
+-- ============================================================
+--  CHUNK COLLECTOR v2 — параллельная батч-декомпиляция
+--  Использует Luacid HTTP в N параллельных корутинах.
+-- ============================================================
+local pendingScripts = {}   -- [src] = { bytecode = ..., ref = ... }
+local pendingOrder = {}     -- массив src
+local collectMode = false
+
+local MAX_CONCURRENT = 8    -- сколько параллельных запросов к Luacid
+local BATCH_SIZE = 8        -- сколько корутин за раз
+
+-- Собирает скрипт в очередь (вместо немедленного decompile).
+-- Возвращает кэш, если он уже есть — тогда в очередь не кладём.
+local function collectScript(src)
+    if not collectMode then
+        return nil
+    end
+    if pendingScripts[src] then
+        return nil
+    end
+    local ok, bc = pcall(getscriptbytecode, src)
+    if not ok or type(bc) ~= "string" or #bc == 0 then
+        return nil
+    end
+    -- Проверяем кэш ДО добавления в очередь
+    local cached = cacheGet(bc)
+    if cached then
+        return cached
+    end
+    pendingScripts[src] = { bytecode = bc, ref = src }
+    table.insert(pendingOrder, src)
+    return nil
+end
+
+-- Включаем режим сбора (вызывать перед основным циклом SaveInstance)
+function GLOBAL_ENV.beginDecompileCollection()
+    collectMode = true
+    pendingScripts = {}
+    pendingOrder = {}
+end
+
+-- Декомпилирует один байткод через Luacid (или fallback).
+-- Возвращает source, либо nil если не удалось.
+local function batchDecompileOne(bytecode, ref)
+    -- 1) Кэш
+    local cached, key = cacheGet(bytecode)
+    if cached then
+        return cached
+    end
+
+    -- 2) Luacid
+    local source
+    if luacid_decompile and ref then
+        local ok, result = pcall(luacid_decompile, ref)
+        if ok and type(result) == "string" and #result > 0
+            and not result:find("^%-%- ") then
+            source = result
+        end
+    end
+
+    -- 3) Fallback: raw bytecode
+    if not source then
+        source = "-- RAW BYTECODE (Luacid unavailable)\n" .. bytecode
+    end
+
+    -- 4) Кэшируем
+    if key then
+        cachePut(key, source)
+    end
+    return source
+end
+
+-- Параллельно декомпилирует всё, что накопилось.
+-- Возвращает [src] = source.
+function GLOBAL_ENV.flushDecompileCollection()
+    collectMode = false
+    local n = #pendingOrder
+    if n == 0 then
+        return {}
+    end
+
+    local results = {}
+    local completed = 0
+
+    -- Разбиваем на батчи по MAX_CONCURRENT
+    local function processBatch(startIdx)
+        local tasks = {}
+        local endIdx = math.min(startIdx + MAX_CONCURRENT - 1, n)
+
+        for i = startIdx, endIdx do
+            local src = pendingOrder[i]
+            local entry = pendingScripts[src]
+            if entry then
+                local co = coroutine.create(function()
+                    local source = batchDecompileOne(entry.bytecode, entry.ref)
+                    results[src] = source
+                    completed += 1
+                end)
+                table.insert(tasks, co)
+            end
+        end
+
+        -- Запускаем все корутины батча
+        for _, co in tasks do
+            local ok, err = coroutine.resume(co)
+            if not ok then
+                warn("[SaveInstance] decompile coroutine error: " .. tostring(err))
+            end
+        end
+
+        -- Ждём завершения батча (Luacid HTTP = yield, корутины завершатся)
+        -- В executor'ах request блокирующий, так что корутины выполнятся синхронно
+        -- внутри resume. Если request асинхронный — нужен task.wait().
+        local batchDone = true
+        for _, co in tasks do
+            if coroutine.status(co) ~= "dead" then
+                batchDone = false
+                break
+            end
+        end
+
+        if not batchDone then
+            -- Асинхронный executor: ждём, пока батч завершится
+            local waited = 0
+            while not batchDone and waited < 60 do
+                task.wait(0.1)
+                waited += 0.1
+                batchDone = true
+                for _, co in tasks do
+                    if coroutine.status(co) ~= "dead" then
+                        batchDone = false
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- Идём батчами
+    for startIdx = 1, n, MAX_CONCURRENT do
+        processBatch(startIdx)
+    end
+
+    pendingScripts = {}
+    pendingOrder = {}
+    return results
+end
+
 local function string_find(s, pattern, init)
 	return string.find(s, pattern, init, true)
 end
@@ -118,6 +266,54 @@ local writefile = writefile
 local getscriptbytecode = global_container.getscriptbytecode -- * A lot of assumptions are made based on whether this function is defined or not. So in certain edge cases, like if the environment defines "decompile" or "getscripthash" function yet doesn't define this function there might be loss of functionality of the saveinstance. Although that would be very rare and weird
 local base64encode = global_container.base64encode
 local base64decode = global_container.base64decode
+
+-- ============================================================
+--  DECOMPILE CACHE v2 — дисковый + in-memory
+--  Ключ: FNV-1a 64-bit хэш байткода
+-- ============================================================
+local DECOMPILE_CACHE_DIR = USSI_FOLDER .. "decompile/"
+pcall(makefolder, DECOMPILE_CACHE_DIR)
+
+local function hashBytes(s)
+	local h1, h2 = 0x811C9DC5, 0x01000193
+	for i = 1, #s do
+		local b = string.byte(s, i)
+		h1 = bit32.bxor(h1, b)
+		h1 = (h1 * 0x01000193) % 0x100000000
+		h2 = bit32.bxor(h2, bit32.lrotate(h1, 7))
+		h2 = (h2 * 0x01000193) % 0x100000000
+	end
+	return string.format("%08x%08x", h1, h2)
+end
+
+local memoryCache = {}
+local cacheHits, cacheMisses = 0, 0
+
+local function cacheGet(bytecode)
+	local key = hashBytes(bytecode)
+	if memoryCache[key] then
+		cacheHits += 1
+		return memoryCache[key], key, true
+	end
+	local path = DECOMPILE_CACHE_DIR .. key .. ".lua"
+	if isfile(path) then
+		local ok, data = pcall(readfile, path)
+		if ok and type(data) == "string" and #data > 0 then
+			memoryCache[key] = data
+			cacheHits += 1
+			return data, key, true
+		end
+	end
+	cacheMisses += 1
+	return nil, key, false
+end
+
+local function cachePut(key, source)
+	if type(source) ~= "string" or #source == 0 then return end
+	if source:find("^%-%- Decompile failed") then return end
+	memoryCache[key] = source
+	pcall(writefile, DECOMPILE_CACHE_DIR .. key .. ".lua", source)
+end
 
 -- ============================================================
 --  decompile: Luacid → global decompile → raw bytecode
