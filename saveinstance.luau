@@ -67,7 +67,7 @@ do
 	local filename = "StreamBuffer"
 
 	StreamBuffer = loadstring(
-		game:HttpGet("https://raw.githubusercontent.com/rbxScriptHub2/SomeHub/main/" .. filename .. ".luau", true),
+		game:HttpGet("https://raw.githubusercontent.com/rbxScriptHub2/UniversalSynSaveInstance/refs/heads/main/SomeHub/" .. filename .. ".luau", true),
 		filename
 	)()
 end
@@ -78,7 +78,7 @@ do
 
 	local finder
 	finder, global_container = loadstring(
-		game:HttpGet("https://raw.githubusercontent.com/rbxScriptHub2/SomeHub/main/" .. filename .. ".luau", true),
+		game:HttpGet("https://raw.githubusercontent.com/rbxScriptHub2/UniversalSynSaveInstance/refs/heads/main/SomeHub/" .. filename .. ".luau", true),
 		filename
 	)()
 
