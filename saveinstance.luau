@@ -119,6 +119,54 @@ local getscriptbytecode = global_container.getscriptbytecode -- * A lot of assum
 local base64encode = global_container.base64encode
 local base64decode = global_container.base64decode
 
+-- ============================================================
+--  decompile: Luacid → global decompile → raw bytecode
+-- ============================================================
+local luacid_decompile = global_container.decompile
+
+-- Если Luacid не подгрузился (нет сети / ключа / getscriptbytecode),
+-- пробуем найти глобальный decompile от executor'а.
+if not luacid_decompile then
+	local candidates = { "decompile", "luadecompile", "decompile_script" }
+	for _, name in candidates do
+		local fn = rawget(getfenv(), name)
+			or (getgenv and rawget(getgenv(), name))
+			or rawget(_G, name)
+		if type(fn) == "function" then
+			luacid_decompile = fn
+			break
+		end
+	end
+end
+
+local function decompile(src)
+	if luacid_decompile then
+		local ok, result = pcall(luacid_decompile, src)
+		if ok and type(result) == "string" and #result > 0 then
+			-- Luacid возвращает ошибки как "-- ..." — не кэшируем их
+			if result:sub(1, 2) ~= "-- " or result:find("^%-%- ") == nil then
+				return result
+			end
+			-- похоже на ошибку — падаем в fallback
+			warn("[SaveInstance] Luacid returned error for " .. tostring(src and src:GetFullName() or "?"))
+		else
+			warn("[SaveInstance] decompile error: " .. tostring(result))
+		end
+	end
+
+	-- Fallback: raw bytecode
+	if type(getscriptbytecode) == "function" then
+		local ok, bc = pcall(getscriptbytecode, src)
+		if ok and type(bc) == "string" and #bc > 0 then
+			return "-- RAW BYTECODE (Luacid unavailable)\n" .. bc
+		end
+	end
+
+	return "-- Decompile failed: no decompiler available\n-- Script: " .. tostring(src and src:GetFullName() or "?")
+end
+
+GLOBAL_ENV.decompile = decompile
+
 local sharedStringId = 1e15 -- 1 quadrillion, up to 9.(9) quadrillion, in theory this shouldn't ever run out and be enough for all sharedstrings ever imaginable 	-- TODO: worst case, add fallback to str randomizer once numbers run out : )
 local sharedStrings = setmetatable({}, {
 	__index = function(self, str)
